@@ -1,174 +1,325 @@
 package main
 
 import (
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
-	"encoding/binary"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
+	"regexp"
+	"strconv"
+	"time"
+
+	"golang.org/x/crypto/curve25519"
 )
 
-// IKEv2Message — структура для сообщений IKEv2
-type IKEv2Message struct {
-	InitiatorSPI uint64 // Идентификатор инициатора
-	ResponderSPI uint64 // Идентификатор ответчика
-	NextPayload  uint8  // Следующий тип полезной нагрузки (IKE_SA_INIT, IKE_AUTH и т.д.)
-	Version      uint8  // Версия IKEv2
-	ExchangeType uint8  // Тип обмена (IKE_SA_INIT, IKE_AUTH)
-	Flags        uint8  // Флаги (например, инициатор или ответчик)
-	MessageID    uint32 // Идентификатор сообщения
-	Length       uint32 // Длина всего сообщения
-	Payload      []byte // Полезная нагрузка (полностью зависит от этапа IKEv2)
-}
-
-// Генерация случайного SPI (идентификатора безопасности)
-func generateSPI() uint64 {
-	spi := make([]byte, 8)
-	rand.Read(spi)
-	return binary.BigEndian.Uint64(spi)
-}
-
-// Генерация собственного открытого ключа DH и создание общего секретного ключа
-func handleIKESAInit(ikeMessage IKEv2Message) ([]byte, *big.Int, error) {
-	// Извлечение открытого ключа клиента из сообщения IKE_SA_INIT (предположим, он начинается с 28 байта)
-	clientPublicKey := new(big.Int).SetBytes(ikeMessage.Payload[28:])
-
-	// Группа 14: 2048-bit MODP (та же, что использует клиент)
-	groupPrime, _ := new(big.Int).SetString("FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E08"+
-		"8A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0"+
-		"BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381FFFFFFFFFFFFFFFF", 16)
-	base := big.NewInt(2)
-
-	// Генерация собственного закрытого и открытого ключа сервера
-	privateKey, err := rand.Int(rand.Reader, groupPrime)
+func encryptAES(key, plaintext []byte) ([]byte, error) {
+	// Создаем новый блок шифрования AES
+	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, nil, fmt.Errorf("Ошибка генерации секретного ключа: %v", err)
-	}
-	serverPublicKey := new(big.Int).Exp(base, privateKey, groupPrime) // g^y mod p
-
-	// Генерация общего секретного ключа
-	sharedSecret := new(big.Int).Exp(clientPublicKey, privateKey, groupPrime) // (g^x)^y mod p = g^(xy) mod p
-
-	// Создание KE полезной нагрузки для ответа (отправляем серверный открытый ключ)
-	kePayload := serverPublicKey.Bytes()
-	return kePayload, sharedSecret, nil
-}
-
-// Создание IKE_SA_INIT ответа с KE полезной нагрузкой сервера
-func createIKESaInitResponse(initiatorSPI, responderSPI uint64, kePayload []byte) IKEv2Message {
-	// Объединение KE полезной нагрузки
-	payload := kePayload
-
-	// Создание сообщения IKE_SA_INIT ответа
-	ikeSaInitResponse := IKEv2Message{
-		InitiatorSPI: initiatorSPI,
-		ResponderSPI: responderSPI,
-		NextPayload:  33,   // IKE_SA_INIT payload
-		Version:      0x20, // IKEv2 Version 2.0
-		ExchangeType: 34,   // IKE_SA_INIT
-		Flags:        0x20, // Ответчик
-		MessageID:    0,    // Идентификатор сообщения
-		Length:       uint32(28 + len(payload)),
-		Payload:      payload,
+		return nil, err
 	}
 
-	return ikeSaInitResponse
-}
-
-// Обработка входящих IKE сообщений
-func handleIncomingMessages(conn *net.UDPConn) {
-	buffer := make([]byte, 1024)
-	for {
-		n, addr, err := conn.ReadFromUDP(buffer)
-		if err != nil {
-			fmt.Println("Ошибка чтения данных:", err)
-			continue
-		}
-
-		if n < 28 {
-			fmt.Println("Ошибка: сообщение слишком короткое.")
-			continue
-		}
-
-		// Разбор IKEv2 сообщения
-		ikeMessage := IKEv2Message{
-			InitiatorSPI: binary.BigEndian.Uint64(buffer[0:8]),
-			ResponderSPI: binary.BigEndian.Uint64(buffer[8:16]),
-			NextPayload:  buffer[16],
-			Version:      buffer[17],
-			ExchangeType: buffer[18],
-			Flags:        buffer[19],
-			MessageID:    binary.BigEndian.Uint32(buffer[20:24]),
-			Length:       binary.BigEndian.Uint32(buffer[24:28]),
-			Payload:      buffer[28:n],
-		}
-
-		fmt.Printf("Получено сообщение от клиента: %+v\n", ikeMessage)
-
-		// Обработка IKE_SA_INIT (первое сообщение)
-		if ikeMessage.ExchangeType == 34 { // IKE_SA_INIT
-			fmt.Println("Обработка IKE_SA_INIT сообщения...")
-
-			// Генерация KE ответа и общего секретного ключа
-			kePayload, sharedSecret, err := handleIKESAInit(ikeMessage)
-			if err != nil {
-				fmt.Println("Ошибка обработки IKE_SA_INIT:", err)
-				continue
-			}
-
-			fmt.Printf("Общий секретный ключ: %x\n", sharedSecret.Bytes())
-
-			// Создание ответа на IKE_SA_INIT
-			ikeSaInitResponse := createIKESaInitResponse(ikeMessage.InitiatorSPI, generateSPI(), kePayload)
-
-			// Отправка ответа клиенту
-			err = sendIKEMessage(conn, addr, ikeSaInitResponse)
-			if err != nil {
-				fmt.Println("Ошибка отправки IKE_SA_INIT ответа:", err)
-				continue
-			}
-			fmt.Println("IKE_SA_INIT ответ отправлен клиенту.")
-		}
+	// Создаем новый GCM, который будет использовать блок шифрования
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
 	}
+
+	// Создаем случайный nonce (инициализационный вектор)
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err = io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+
+	// Шифруем plaintext
+	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
+	return ciphertext, nil
 }
 
-// Функция для отправки IKE сообщения сервером
-func sendIKEMessage(conn *net.UDPConn, addr *net.UDPAddr, ikeMessage IKEv2Message) error {
-	// Формирование заголовка IKEv2 сообщения
-	header := make([]byte, 28)
-	binary.BigEndian.PutUint64(header[0:8], ikeMessage.InitiatorSPI)
-	binary.BigEndian.PutUint64(header[8:16], ikeMessage.ResponderSPI)
-	header[16] = ikeMessage.NextPayload
-	header[17] = ikeMessage.Version
-	header[18] = ikeMessage.ExchangeType
-	header[19] = ikeMessage.Flags
-	binary.BigEndian.PutUint32(header[20:24], ikeMessage.MessageID)
-	binary.BigEndian.PutUint32(header[24:28], ikeMessage.Length)
+func decryptAES(key, ciphertext []byte) ([]byte, error) {
+	// Создаем новый блок шифрования AES
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
 
-	// Объединение заголовка и полезной нагрузки
-	message := append(header, ikeMessage.Payload...)
+	// Создаем новый GCM, который будет использовать блок шифрования
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
 
-	// Отправка IKE сообщения клиенту
-	_, err := conn.WriteToUDP(message, addr)
+	// Извлекаем nonce из начала ciphertext
+	nonceSize := gcm.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+
+	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
+
+	// Расшифровываем ciphertext
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return plaintext, nil
+}
+
+// Генерация случайного nonce на 32 байта
+func generateNonce() ([]byte, error) {
+	nonce := make([]byte, 32)
+	_, err := rand.Read(nonce)
+	return nonce, err
+}
+
+// Генерация приватного ключа RSA
+func generatePrivateKey() (*rsa.PrivateKey, error) {
+	return rsa.GenerateKey(rand.Reader, 2048)
+}
+
+// Генерация самоподписанного сертификата
+func generateCertificate(privKey *rsa.PrivateKey) (*x509.Certificate, error) {
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			Organization: []string{"Example Inc."},
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().AddDate(1, 0, 0),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &privKey.PublicKey, privKey)
+	if err != nil {
+		return nil, err
+	}
+
+	return x509.ParseCertificate(certDER)
+}
+
+// Генерация параметров безопасности SAi и KEi
+func generateSAiKEi() (string, []byte, []byte, error) {
+	SAi := "{encryption=aes256, prf=hmac-sha256, dh=curve25519}"
+
+	// Генерация ключевой пары Diffie-Hellman
+	privateKey := make([]byte, 32)
+	_, err := rand.Read(privateKey)
+	if err != nil {
+		return "", nil, nil, err
+	}
+
+	publicKey, err := curve25519.X25519(privateKey, curve25519.Basepoint)
+	if err != nil {
+		return "", nil, nil, err
+	}
+
+	return SAi, privateKey, publicKey, nil
+}
+
+func sendData(conn net.Conn, data []byte) error {
+	_, err := conn.Write(data)
 	return err
 }
 
-func main() {
-	// Запуск UDP сервера
-	serverAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:5000")
-	if err != nil {
-		fmt.Println("Ошибка разрешения адреса:", err)
-		return
+func extractAndConvert(input string, method int) ([]byte, error) {
+	var re *regexp.Regexp
+	switch method {
+	case 1:
+		re = regexp.MustCompile(`KEr: ([0-9a-fA-F]+)`)
+	case 2:
+		re = regexp.MustCompile(`\[SK\{IDr\}\]: ([0-9a-fA-F]+)`)
+	case 3:
+		re = regexp.MustCompile(`AUTH: ([0-9a-fA-F]+)`)
+	}
+	matches := re.FindStringSubmatch(input)
+	if len(matches) < 2 {
+		return nil, fmt.Errorf("последовательность не найдена")
 	}
 
-	conn, err := net.ListenUDP("udp", serverAddr)
-	if err != nil {
-		fmt.Println("Ошибка создания UDP сервера:", err)
-		return
+	// Извлеченная последовательность
+	keiSequence := matches[1]
+
+	// Проверка, что длина последовательности четная
+	if len(keiSequence)%2 != 0 {
+		return nil, fmt.Errorf("послед нечетная")
 	}
+
+	// Преобразование последовательности в байты
+	byteArray := make([]byte, len(keiSequence)/2)
+	for i := 0; i < len(keiSequence); i += 2 {
+		hexPair := keiSequence[i : i+2]
+		byteValue, err := strconv.ParseUint(hexPair, 16, 8)
+		if err != nil {
+			return nil, fmt.Errorf("ошибка преобразования 16теричных пар в байты: %v", err)
+		}
+		byteArray[i/2] = byte(byteValue)
+	}
+
+	return byteArray, nil
+}
+
+// Чтение данных из соединения
+func readData(conn net.Conn) ([]byte, error) {
+	buffer := make([]byte, 4096)
+	n, err := conn.Read(buffer)
+	if err != nil {
+		return nil, err
+	}
+	return buffer[:n], nil
+}
+
+func handleConnection(conn net.Conn) {
 	defer conn.Close()
-	fmt.Println("IKEv2 сервер запущен и ожидает входящих соединений...")
 
-	// Обработка входящих сообщений
-	handleIncomingMessages(conn)
+	// Шаг 1: R<-I: EAP-Request/Identity
+	err := sendData(conn, []byte("EAP-Request/Identity"))
+	if err != nil {
+		fmt.Println("Ошибка отправки запроса Identity:", err)
+		return
+	}
+
+	// Шаг 2: R->I: EAP-Response/Identity(Id)
+	idData, err := readData(conn)
+	if err != nil {
+		fmt.Println("Ошибка чтения ID:", err)
+		return
+	}
+	fmt.Println("Получен Identity:", string(idData))
+
+	// Шаг 3: R<-I: EAP-Req (HDR, SAi, KEi, Ni)
+	nonce, _ := generateNonce()
+	SAi, privateKey, publicKey, err := generateSAiKEi()
+	if err != nil {
+		fmt.Println("Ошибка генерации SAi и KEi:", err)
+		return
+	}
+
+	fmt.Println("---------------------------------------")
+	fmt.Printf("KEi: %x\n", publicKey)
+	fmt.Println(publicKey)
+	fmt.Println("---------------------------------------")
+
+	message := fmt.Sprintf("EAP-Req (HDR, SAi, KEi, Ni)\nSAi: %s\nKEi: %x\nNi: %x", SAi, publicKey, nonce)
+	err = sendData(conn, []byte(message))
+	if err != nil {
+		fmt.Println("Ошибка отправки IKE_SA_INIT запроса:", err)
+		return
+	}
+
+	// Шаг 4: R->I: EAP-Res (HDR, SAr, KEr, Nr, [CERTREQ], [SK{IDr}])
+	response, err := readData(conn)
+	if err != nil {
+		fmt.Println("Ошибка чтения EAP-Res:", err)
+		return
+	}
+	fmt.Println("Получен EAP-Res:", string(response))
+
+	// Парсим публичный ключ клиента KEr из сообщения
+	clientKEr, err := extractAndConvert(string(response), 1)
+
+	// Парсим IDr из сообщения
+	clientIDr, err := extractAndConvert(string(response), 2)
+
+	fmt.Printf("IDr: %x\n", clientIDr)
+	fmt.Println("---------------------------------------")
+
+	sharedSecret, err := curve25519.X25519(privateKey, clientKEr)
+	if err != nil {
+		fmt.Println("Ошибка вычисления общего секрета:", err)
+		return
+	}
+
+	fmt.Println("---------------------------------------")
+	fmt.Printf("Shared Secret: %x\n", sharedSecret)
+	fmt.Println("---------------------------------------")
+
+	IDr, _ := decryptAES(sharedSecret, clientIDr)
+	fmt.Printf("IDr decr: %s\n", string(IDr))
+
+	// Шаг 5: R<-I: EAP-Req (HDR, SK{IDi, [CERT], [CERTREQ], [NFID], AUTH})
+	IDi := []byte("server")
+	privKey, _ := generatePrivateKey()
+	cert, _ := generateCertificate(privKey)
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+
+	// Генерация AUTH на основе общего секрета
+	authPayload := hmac.New(sha256.New, sharedSecret)
+	authPayload.Write([]byte("authentication data"))
+	auth := authPayload.Sum(nil)
+
+	encryptAuth, _ := encryptAES(sharedSecret, auth)
+
+	message = fmt.Sprintf(
+		"EAP-Req (HDR, SK{IDi, CERT, CERTREQ, NFID, AUTH})\nIDi: %s\nCERT: %s\nCERTREQ: %t\nNFID: %s\nAUTH: %x",
+		IDi, certPEM, true, "Example NFID", encryptAuth,
+	)
+
+	fmt.Println("-----------FIRST AUTH FROM SERVER--------------")
+	fmt.Printf("AUTH: %x\n", auth)
+	fmt.Printf("Encrypt AUTH: %x\n", encryptAuth)
+	fmt.Println("-----------END--------------")
+
+	err = sendData(conn, []byte(message))
+	if err != nil {
+		fmt.Println("Ошибка отправки IKE_AUTH запроса:", err)
+		return
+	}
+
+	// Шаг 6: R->I: EAP-Res (HDR, SK{IDr, [CERT], AUTH})
+	response, err = readData(conn)
+	if err != nil {
+		fmt.Println("Ошибка чтения EAP-Res:", err)
+		return
+	}
+	fmt.Println("Получен EAP-Res:", string(response))
+
+	checkEncryptAuth, _ := extractAndConvert(string(response), 3)
+	checkAuth, _ := decryptAES(sharedSecret, checkEncryptAuth)
+
+	fmt.Println("-----------FINAL AUTH--------------")
+	fmt.Printf("AUTH: %x\n", checkAuth)
+	fmt.Println("-----------END--------------")
+
+	// Шаг 7: R<-I: EAP-Success
+	if bytes.Equal(auth, checkAuth) {
+		err = sendData(conn, []byte("EAP-Success"))
+		if err != nil {
+			fmt.Println("Ошибка отправки EAP-Success:", err)
+			return
+		}
+		fmt.Println("EAP-Success отправлено")
+	}
+
+}
+
+func main() {
+	listener, err := net.Listen("tcp", ":5000")
+	if err != nil {
+		fmt.Println("Ошибка запуска сервера:", err)
+		return
+	}
+	defer listener.Close()
+	fmt.Println("Сервер слушает порт 5000")
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			fmt.Println("Ошибка подключения:", err)
+			continue
+		}
+		go handleConnection(conn)
+	}
 }
